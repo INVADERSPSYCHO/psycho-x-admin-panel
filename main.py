@@ -3,17 +3,17 @@ import secrets
 import json
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Query, HTTPException, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse as StarletteJSONResponse
 import requests
 import pyarrow.parquet as pq
 import io
 
 # ── CONFIG ──────────────────────────────────────────────
 API_KEY = os.environ.get("API_KEY", "psychoxd")      # Master key
-MASTER_KEY = os.environ.get("MASTER_KEY", "admin123") # Admin password for /apikey
+MASTER_KEY = os.environ.get("MASTER_KEY", "admin123") # Admin password
 DEVELOPER = "@psychopathmc"
 SUPPORT_MSG = "For API purchase, contact @psychopathmc"
 BASE_URL = "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main"
@@ -28,9 +28,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Custom Exception Handler ────────────────────────────
 @app.exception_handler(FastAPIHTTPException)
 async def custom_http_exception_handler(request: Request, exc: FastAPIHTTPException):
-    return JSONResponse(
+    return StarletteJSONResponse(
         status_code=exc.status_code,
         content={
             "error": exc.detail,
@@ -181,9 +182,7 @@ async def login_page():
     """
 
 @app.post("/apikey/login")
-async def login_post(request: Request):
-    form = await request.form()
-    master_key = form.get("master_key")
+async def login_post(master_key: str = Form(...)):  # 🔥 Use Form instead of request.form()
     if master_key != MASTER_KEY:
         return HTMLResponse("<h3>❌ Invalid master key. <a href='/apikey/login'>Try again</a></h3>", status_code=401)
     session_id = secrets.token_urlsafe(16)
