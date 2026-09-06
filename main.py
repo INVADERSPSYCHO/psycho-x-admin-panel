@@ -1,214 +1,121 @@
-import asyncio
-import glob
-import json
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
-from datetime import datetime, timedelta
 import secrets
+import json
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Query, HTTPException, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import HTTPException as FastAPIHTTPException
+from starlette.responses import JSONResponse
+import requests
+import pyarrow.parquet as pq
+import io
 
-import duckdb
-import gradio as gr
-import httpx
-from fastapi import FastAPI, HTTPException, Query, Response, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+# ── CONFIG ──────────────────────────────────────────────
+API_KEY = os.environ.get("API_KEY", "psychoxd")      # Master key
+MASTER_KEY = os.environ.get("MASTER_KEY", "admin123") # Admin password for /apikey
+DEVELOPER = "@psychopathmc"
+SUPPORT_MSG = "For API purchase, contact @psychopathmc"
+BASE_URL = "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main"
+CACHE_TTL = 300
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
-HF_INDEX_BASE = os.environ.get(
-    "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
-).rstrip("/")
-INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
-DUPLICATE_CAP = 2
+app = FastAPI(title="PsychopathMC OSINT API")
 
-# 🔥 Master API key for admin login
-MASTER_KEY = os.environ.get("MASTER_KEY", "admin123")
-API_KEY = os.environ.get("API_KEY", "psychoxd")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-SEARCH_FIELDS = [
-    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
-    "address", "district", "pincode", "state", "town", "source",
-]
-NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
-
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
-
-REMOTE_INDEXES = {
-    "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
-    "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
-}
-
-# ── In-memory storage for generated keys ──────────────────────────────────
-_generated_keys = {}
-_admin_session = {}
-
-# ── DuckDB Connection Pool ──────────────────────────────────────────────────
-_conns: list[duckdb.DuckDBPyConnection] = []
-_conns_lock = threading.Lock()
-_thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
-
-def _idx_ready(kind: str) -> bool:
-    return kind in REMOTE_INDEXES
-
-def _new_conn() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    con.execute("SET home_directory='/tmp'")
-    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL parquet; LOAD parquet;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
-        lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
-    return con
-
-def _thread_id() -> int:
-    tid = getattr(_thread_local, "id", None)
-    if tid is None:
-        with _conns_lock:
-            tid = len(_conns)
-            _thread_local.id = tid
-    return tid
-
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _thread_id()
-    with _conns_lock:
-        while len(_conns) <= ident:
-            _conns.append(_new_conn())
-    return _conns[ident]
-
-# ── Dedup & Connected Records ───────────────────────────────────────────────
-def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
-    if ph or ad:
-        return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
-
-def _connected_numbers(row: dict) -> list[dict]:
-    connected, seen = [], set()
-    for field in NUMBER_FIELDS:
-        raw = row.get(field)
-        if raw is None:
-            continue
-        value = str(raw).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        connected.append({"field": field, "value": value})
-    return connected
-
-def _cap_duplicates(rows: list[dict]) -> list[dict]:
-    seen: dict[tuple, int] = {}
-    out = []
-    for r in rows:
-        k = _person_key(r)
-        n = seen.get(k, 0)
-        if n < DUPLICATE_CAP:
-            seen[k] = n + 1
-            record = dict(r)
-            record["connected_numbers"] = _connected_numbers(record)
-            out.append(record)
-    return out
-
-# ── Search Logic ────────────────────────────────────────────────────────────
-def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}")
-    v = value.replace("'", "''")
-
-    if mode == "exact":
-        if field == "phoneNumber" and _idx_ready("phone"):
-            view = "people_phone"
-        elif field == "aadharNumber" and _idx_ready("aadhar"):
-            view = "people_aadhar"
-        elif field == "otherNumber":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
-    elif mode == "contains":
-        if field == "name":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    con = _get_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
-    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-
-def _unified_search(q: str, limit: int = 10) -> dict:
-    q = q.strip()
-    is_num = q.isdigit() and len(q) >= 8
-
-    if is_num:
-        all_rows = []
-        searched = []
-        if _idx_ready("phone"):
-            r = _run_field_search("phoneNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("phoneNumber")
-        if not all_rows and _idx_ready("aadhar"):
-            r = _run_field_search("aadharNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("aadharNumber")
-        all_rows = _cap_duplicates(all_rows)[:limit]
-        return {
-            "query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows,
+@app.exception_handler(FastAPIHTTPException)
+async def custom_http_exception_handler(request: Request, exc: FastAPIHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "developer": DEVELOPER,
+            "support": SUPPORT_MSG,
         }
-    else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+    )
 
-# ── FastAPI (Branded as PSYCHOMC OSINT) ──────────────────────────────────────
-fastapi_app = FastAPI(title="PSYCHOMC OSINT API", docs_url="/docs")   # ✅ ICMR HATA DIYA
+# ── Helper: Circle Lookup ──────────────────────────────
+def get_circle(num: str) -> str:
+    prefixes = {
+        "9810": "AIRTEL DELHI", "9871": "AIRTEL DELHI", "9818": "AIRTEL DELHI",
+        "9910": "VI DELHI", "8826": "JIO DELHI", "9999": "AIRTEL DELHI",
+        "9971": "AIRTEL DELHI", "9883": "JIO WB", "9564": "JIO WB",
+    }
+    pref = num[:4]
+    return prefixes.get(pref, "UNKNOWN CIRCLE")
 
-class BatchRequest(BaseModel):
-    queries: list[dict[str, Any]]
-    limit: int = 10
+# ── Cache ────────────────────────────────────────────────
+_cache = {}
+_cache_time = {}
 
-# ---------- Existing Endpoints ----------
-@fastapi_app.get("/")
+def get_cache(url, column, value):
+    key = f"{url}|{column}|{value}"
+    if key in _cache and (datetime.now() - _cache_time[key]).seconds < CACHE_TTL:
+        return _cache[key]
+    return None
+
+def set_cache(url, column, value, data):
+    key = f"{url}|{column}|{value}"
+    _cache[key] = data
+    _cache_time[key] = datetime.now()
+    if len(_cache) > 100:
+        oldest = min(_cache_time, key=_cache_time.get)
+        del _cache[oldest]
+        del _cache_time[oldest]
+
+# ── Fetch Data ───────────────────────────────────────────
+def fetch_data(url: str, column: str, value: str, limit: int = 15):
+    cached = get_cache(url, column, value)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return []
+        needed_cols = ["name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber", "address"]
+        table = pq.read_table(io.BytesIO(resp.content), columns=needed_cols)
+        df = table.to_pandas()
+        if column not in df.columns:
+            return []
+        filtered = df[df[column] == value]
+        results = filtered.head(limit).to_dict(orient="records")
+        set_cache(url, column, value, results)
+        return results
+    except Exception as e:
+        print(f"Fetch error: {e}")
+        return []
+
+# ── In-Memory Key Storage ──────────────────────────────
+_generated_keys = {}   # key -> { limit, expiry, usage, created }
+_admin_session = {}    # session_id -> expiry
+
+# ── Endpoints ────────────────────────────────────────────
+@app.get("/")
 def root():
     return {
-        "app": "PSYCHOMC OSINT API",   # ✅ ICMR HATA DIYA
-        "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
-        "columns": SEARCH_FIELDS,
-        "docs": "/docs",
-        "developer": "@psychopathmc",   # 🔥 TERA CREDIT
+        "message": "PsychoAPI is live. Use /search?q=number&key=psychoxd",
+        "developer": DEVELOPER,
+        "support": SUPPORT_MSG,
     }
 
-@fastapi_app.get("/health")
+@app.get("/health")
 def health():
-    return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-            "index_source": INDEX_SOURCE}
+    return {"status": "ok", "developer": DEVELOPER, "support": SUPPORT_MSG}
 
-@fastapi_app.get("/search")
-async def search(
+@app.get("/search")
+def search(
     q: str | None = Query(None),
     mobile: str | None = Query(None),
-    field: str | None = Query(None),
-    mode: str = Query("exact"),
-    limit: int = Query(10, ge=1, le=1000),
-    pretty: bool = Query(True),
     key: str = Query(..., description="API Key required"),
+    limit: int = Query(5, ge=1, le=20)
 ):
+    # Check master key or generated keys
     if key == API_KEY:
         pass
     elif key in _generated_keys:
@@ -216,48 +123,48 @@ async def search(
         if expiry and datetime.now() > expiry:
             raise HTTPException(status_code=401, detail="API key expired")
         usage = _generated_keys[key].get("usage", 0)
-        limit_val = _generated_keys[key].get("limit", 0)
-        if limit_val > 0 and usage >= limit_val:
+        lim = _generated_keys[key].get("limit", 0)
+        if lim > 0 and usage >= lim:
             raise HTTPException(status_code=429, detail="API key limit exceeded")
         _generated_keys[key]["usage"] = usage + 1
     else:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-    q_val = (q or mobile or "").strip()
-    if not q_val:
+    query = (q or mobile or "").strip()
+    if not query:
         raise HTTPException(422, "Provide q or mobile")
-    loop = asyncio.get_running_loop()
-    if field:
-        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
-    else:
-        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    result = {"success": bool(data["count"]), **data, "number": q_val,
-              "total": data["count"]}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
 
-@fastapi_app.post("/search/parallel")
-async def search_parallel(req: BatchRequest):
-    if not req.queries:
-        raise HTTPException(400, "queries must not be empty")
-    if len(req.queries) > 50:
-        raise HTTPException(400, "max 50 queries per batch")
-    loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(pool, _run_field_search,
-                             item.get("field", "phoneNumber"),
-                             item.get("value", ""),
-                             item.get("mode", "exact"),
-                             int(item.get("limit", req.limit)))
-        for item in req.queries
-    ]
-    results = await asyncio.gather(*tasks)
-    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
-                                       indent=2, ensure_ascii=False),
-                    media_type="application/json")
+    last_digit = query[-1]
+    shard = int(last_digit) % 7
 
-# ── API Key Management System ──────────────────────────────────────────────
-@fastapi_app.get("/apikey/login", response_class=HTMLResponse)
+    phone_url = f"{BASE_URL}/idx_phone.{shard}.parquet"
+    results = fetch_data(phone_url, "phoneNumber", query, limit)
+
+    if not results:
+        aadhar_url = f"{BASE_URL}/idx_aadhar.{shard}.parquet"
+        results = fetch_data(aadhar_url, "aadharNumber", query, limit)
+
+    # Deduplicate
+    seen = set()
+    unique_results = []
+    for row in results:
+        aadhar_val = row.get("aadharNumber")
+        if aadhar_val not in seen:
+            seen.add(aadhar_val)
+            unique_results.append(row)
+    results = unique_results
+
+    return {
+        "success": len(results) > 0,
+        "query": query,
+        "count": len(results),
+        "results": results,
+        "developer": DEVELOPER,
+        "support": SUPPORT_MSG,
+    }
+
+# ── API Key Management Dashboard ─────────────────────────
+@app.get("/apikey/login", response_class=HTMLResponse)
 async def login_page():
     return """
     <html>
@@ -273,7 +180,7 @@ async def login_page():
     </html>
     """
 
-@fastapi_app.post("/apikey/login")
+@app.post("/apikey/login")
 async def login_post(request: Request):
     form = await request.form()
     master_key = form.get("master_key")
@@ -285,7 +192,7 @@ async def login_post(request: Request):
     response.set_cookie(key="session_id", value=session_id, httponly=True)
     return response
 
-@fastapi_app.get("/apikey/dashboard", response_class=HTMLResponse)
+@app.get("/apikey/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     session_id = request.cookies.get("session_id")
     if not session_id or session_id not in _admin_session or datetime.now() > _admin_session[session_id]:
@@ -293,7 +200,7 @@ async def dashboard(request: Request):
 
     rows = ""
     for k, v in _generated_keys.items():
-        expiry = v.get("expiry", "N/A")
+        expiry = v.get("expiry")
         if expiry and isinstance(expiry, datetime):
             expiry = expiry.strftime("%Y-%m-%d %H:%M")
         rows += f"""
@@ -332,7 +239,7 @@ async def dashboard(request: Request):
     """
     return HTMLResponse(html)
 
-@fastapi_app.post("/apikey/create")
+@app.post("/apikey/create")
 async def create_key(request: Request):
     session_id = request.cookies.get("session_id")
     if not session_id or session_id not in _admin_session or datetime.now() > _admin_session[session_id]:
@@ -350,7 +257,7 @@ async def create_key(request: Request):
     }
     return RedirectResponse(url="/apikey/dashboard", status_code=302)
 
-@fastapi_app.post("/apikey/delete")
+@app.post("/apikey/delete")
 async def delete_key(request: Request):
     session_id = request.cookies.get("session_id")
     if not session_id or session_id not in _admin_session or datetime.now() > _admin_session[session_id]:
@@ -361,7 +268,7 @@ async def delete_key(request: Request):
         del _generated_keys[key_to_delete]
     return RedirectResponse(url="/apikey/dashboard", status_code=302)
 
-@fastapi_app.get("/apikey/logout")
+@app.get("/apikey/logout")
 async def logout(request: Request):
     session_id = request.cookies.get("session_id")
     if session_id in _admin_session:
@@ -369,120 +276,3 @@ async def logout(request: Request):
     response = RedirectResponse(url="/apikey/login", status_code=302)
     response.delete_cookie("session_id")
     return response
-
-# ── Pinger ──────────────────────────────────────────────────────────────────
-async def pinger():
-    port = os.getenv("PORT", "7860")
-    url = f"http://localhost:{port}/health"
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            await asyncio.sleep(120)
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    print(f"[Pinger] OK")
-                else:
-                    print(f"[Pinger] Unexpected status: {resp.status_code}")
-            except Exception as e:
-                print(f"[Pinger] Error: {e}")
-
-@fastapi_app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(pinger())
-
-# ── Gradio UI (Branding Updated) ──────────────────────────────────────────
-def format_result(row: dict) -> str:
-    lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
-        if val:
-            lines.append(f"**{field}:** {val}")
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
-    return "\n\n".join(lines)
-
-def search_ui(query: str, limit: int) -> str:
-    if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
-    q = query.strip()
-    try:
-        data = _unified_search(q, int(limit))
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-    count = data["count"]
-    results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
-    if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
-    parts = []
-    for i, row in enumerate(results, 1):
-        parts.append(f"### Result {i}\n{format_result(row)}")
-    return header + "\n\n---\n\n".join(parts)
-
-def build_ui():
-    with gr.Blocks(
-        title="PSYCHOMC OSINT API",   # ✅ ICMR HATA DIYA
-        theme=gr.themes.Soft(),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; }
-        """
-    ) as demo:
-        gr.Markdown("# 🔍 PSYCHOMC OSINT API", elem_classes="main-title")   # ✅ ICMR HATA DIYA
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
-
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label="Search Query",
-                    placeholder="Phone number, Aadhaar, ya name daalo...",
-                    lines=1,
-                )
-            with gr.Column(scale=1):
-                limit_slider = gr.Slider(
-                    minimum=1, maximum=50, value=10, step=1,
-                    label="Max Results",
-                )
-
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
-        output = gr.Markdown(label="Results")
-
-        search_btn.click(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-        query_input.submit(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-
-        gr.Markdown("---")
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints** (via FastAPI):
-- `GET /search?q=<number>&key=YOUR_KEY` — Phone/Aadhaar search
-- `GET /search?mobile=<number>&key=YOUR_KEY` — Phone search (alias)
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
-
-**Data Source:** [Public HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
-            """)
-
-        gr.Markdown(
-            "---\n"
-            "<div class='footer'>"
-            "👨‍💻 **Developer:** @psychopathmc  |  📢 **Channel:** @psychodagoated"
-            "</div>",
-            elem_classes="footer"
-        )
-
-    return demo
-
-demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
