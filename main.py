@@ -29,7 +29,7 @@ DUPLICATE_CAP = 2
 
 # 🔥 Master API key for admin login
 MASTER_KEY = os.environ.get("MASTER_KEY", "admin123")
-API_KEY = os.environ.get("API_KEY", "tnum1906")
+API_KEY = os.environ.get("API_KEY", "psychoxd")
 
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
